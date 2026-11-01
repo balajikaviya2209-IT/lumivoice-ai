@@ -130,7 +130,15 @@ function srWhenFree(){
   });
 }
 
-function lockOn(){return !!(prefs.lock&&vp)}
+let lockBroken=false;   // set when this phone cannot share the mic between speech recognition and the voiceprint check
+function lockOn(){return !!(prefs.lock&&vp&&!lockBroken)}
+function dropLock(){
+  lockBroken=true;
+  if(cap){try{cap.stop()}catch(e){}cap=null}
+  if(wake.cap){try{wake.cap.stop()}catch(e){}wake.cap=null}
+  releaseMic();refreshUI();
+  L.toast('This phone cannot share the microphone with the voice lock, so the lock is paused. Reload the page to turn it back on.');
+}
 function idleText(){return lockOn()?'Tap to talk. Only your voice works.':'Tap to talk'}
 function setState(s,t){
   vstate=s;orb.className='orb '+s;
@@ -141,7 +149,7 @@ function setState(s,t){
 function setSwitch(id,on){const b=$(id);b.setAttribute('aria-checked',on?'true':'false')}
 function refreshUI(){
   setSwitch('#swLock',lockOn());setSwitch('#swSpeak',prefs.speak);setSwitch('#swHands',prefs.hands);setSwitch('#swWake',prefs.wake);syncWakeCap();
-  $('#lockSub').textContent=vp?(prefs.lock?'On: only your voice is accepted':'Voice recorded, lock is off'):'Not set up';
+  $('#lockSub').textContent=vp?(lockOn()?'On: only your voice is accepted':prefs.lock?'Paused: this phone cannot share the mic':'Voice recorded, lock is off'):'Not set up';
   $('#lockSetupT').textContent=vp?'Voice lock settings':'Set up voice lock';
   const sp=$('#spk');sp.classList.toggle('off',!prefs.speakChat);sp.setAttribute('aria-pressed',String(!!prefs.speakChat));
   if(vstate==='idle')setState('idle');
@@ -268,7 +276,10 @@ async function startRec(tries){
   r.onend=()=>{
     if(rec!==r)return;                         // aborted by us (tab change etc.)
     rec=null;
-    if(err==='audio-capture'&&!text&&tries<2&&vstate==='listening'){startRec(tries+1);return}   // mic was busy, try again
+    if((err==='audio-capture'||err==='aborted')&&!text&&vstate==='listening'){
+      if(cap)dropLock();                       // the voiceprint stream is what blocks it
+      if(tries<2){startRec(tries+1);return}
+    }
     finishListening(text.trim(),err);
   };
   try{r.start();srOpen(r)}
@@ -409,8 +420,10 @@ function loopWake(){
     if(err==='not-allowed'||err==='service-not-allowed'){
       stopWake();L.toast('The wake word needs microphone access.');return;
     }
-    if(err==='audio-capture'){                              // mic busy (another app/tab): back off and retry
-      if(++wake.fail>4){stopWake();L.toast('The microphone is busy. Close other apps using it, then turn the wake word on again.');return}
+    if(err==='audio-capture'||(err==='aborted'&&wake.cap)){   // mic busy: back off and retry
+      wake.fail++;
+      if(wake.cap&&wake.fail>=2){dropLock();wake.fail=0;setTimeout(loopWake,1500);return}   // the voiceprint stream is what blocks it
+      if(wake.fail>4){stopWake();L.toast('The microphone is busy. Close other apps using it, then turn the wake word on again.');return}
       setTimeout(loopWake,1500*wake.fail);return;
     }
     setTimeout(loopWake,err==='network'?3000:err==='no-speech'?250:600);   // browsers end long sessions; start again
