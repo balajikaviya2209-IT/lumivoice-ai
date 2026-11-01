@@ -115,7 +115,20 @@ function Capture(st,onLevel){
 /* ================= UI state ================= */
 const orb=$('#orb'),vstatus=$('#vstatus'),vheard=$('#vheard'),vsay=$('#vsay');
 let vstate='idle',curTab='chat',rec=null,cap=null,speakTok=0;
-const wake={sr:null,paused:false,armed:false,armT:0,resumeT:0,cap:null,wl:null};
+const wake={sr:null,paused:false,armed:false,armT:0,resumeT:0,cap:null,wl:null,fail:0};
+
+/* ONE speech recognizer at a time (fixes "cannot record now as Chrome is recording").
+   Android Chrome refuses a new recognizer until the previous one has fully released the mic,
+   so every start waits until none is live and a short gap has passed. */
+const srLive=new Set(); let srEnd=0; const SR_GAP=700;
+function srOpen(r){srLive.add(r);r.addEventListener('end',()=>{srLive.delete(r);srEnd=Date.now()})}
+function srWhenFree(){
+  const t0=Date.now();
+  return new Promise(res=>{
+    const t=()=>{if((!srLive.size&&Date.now()-srEnd>=SR_GAP)||Date.now()-t0>3000)res();else setTimeout(t,60)};
+    t();
+  });
+}
 
 function lockOn(){return !!(prefs.lock&&vp)}
 function idleText(){return lockOn()?'Tap to talk. Only your voice works.':'Tap to talk'}
@@ -231,7 +244,7 @@ const ERR={
   'not-allowed':'Microphone or speech recognition is blocked. Allow it in your browser settings.',
   'service-not-allowed':'Speech recognition is blocked in this browser.',
   'network':'Speech recognition needs an internet connection.',
-  'audio-capture':'I could not find a microphone.',
+  'audio-capture':'The microphone is busy. Close other apps or tabs using it, then try again.',
   'no-speech':"I didn't hear anything."
 };
 async function listen(){
@@ -242,14 +255,28 @@ async function listen(){
   try{
     if(lockOn()){const st=await getStream();cap=Capture(st,r=>orb.style.setProperty('--lvl',Math.min(1,r*8)))}
   }catch(e){setState('idle','Microphone access was blocked.');return}
+  setState('listening');                       // this also pauses the wake-word recognizer
+  startRec(0);
+}
+async function startRec(tries){
+  await srWhenFree();                          // wait until the wake-word recognizer has fully released the mic
+  if(vstate!=='listening')return;              // cancelled while waiting
   const r=new SR();rec=r;r.lang=navigator.language||'en-US';r.interimResults=true;r.continuous=false;r.maxAlternatives=1;
   let text='',err='';
   r.onresult=ev=>{let t='';for(let i=0;i<ev.results.length;i++)t+=ev.results[i][0].transcript;text=t;vheard.textContent=t?'“'+t.trim()+'”':''};
   r.onerror=ev=>{err=ev.error||'error'};
-  r.onend=()=>{rec=null;finishListening(text.trim(),err)};
-  const hadWake=prefs.wake;setState('listening');
-  if(hadWake)await new Promise(res=>setTimeout(res,250));
-  try{r.start()}catch(e){if(cap){cap.stop();cap=null}setState('idle')}
+  r.onend=()=>{
+    if(rec!==r)return;                         // aborted by us (tab change etc.)
+    rec=null;
+    if(err==='audio-capture'&&!text&&tries<2&&vstate==='listening'){startRec(tries+1);return}   // mic was busy, try again
+    finishListening(text.trim(),err);
+  };
+  try{r.start();srOpen(r)}
+  catch(e){
+    rec=null;
+    if(tries<2&&vstate==='listening'){startRec(tries+1);return}
+    if(cap){cap.stop();cap=null}setState('idle');
+  }
 }
 async function finishListening(text,err){
   const sum=cap?cap.stop():null;cap=null;
@@ -336,7 +363,7 @@ async function startWake(){
   if(!window.isSecureContext){L.toast('The wake word needs HTTPS or localhost');return}
   try{if(lockOn()){const st=await getStream();wake.cap=Capture(st)}}
   catch(e){L.toast('Microphone access was blocked.');return}
-  prefs.wake=true;wake.paused=false;wake.armed=false;
+  prefs.wake=true;wake.paused=false;wake.armed=false;wake.fail=0;
   beep([660]);lockScreen();updateBadge();loopWake();
   L.toast('Say “Hi Lumi”. The microphone stays on while this page is open.');
 }
@@ -360,7 +387,7 @@ function resumeWake(){
     if(prefs.hands&&curTab==='voice')return;                 // hands-free conversation takes the mic
     wake.paused=false;wake.armed=false;if(wake.cap)wake.cap.take();   // drop anything recorded while Lumi spoke
     updateBadge();loopWake();
-  },400);
+  },700);
 }
 function loopWake(){
   if(!prefs.wake||wake.paused||document.hidden||wake.sr)return;
@@ -370,6 +397,7 @@ function loopWake(){
   r.onresult=ev=>{
     for(let i=ev.resultIndex;i<ev.results.length;i++){
       const res=ev.results[i],t=res[0].transcript;
+      wake.fail=0;
       if(res.isFinal){if(!done.has(i)){done.add(i);onWakeFinal(t,i,early)}}
       else if(!wake.armed&&!early.has(i)&&findWake(t)){early.add(i);beep()}      // quick "ding" as soon as it hears you
     }
@@ -378,12 +406,20 @@ function loopWake(){
   r.onend=()=>{
     if(wake.sr===r)wake.sr=null;
     if(!prefs.wake||wake.paused)return;
-    if(err==='not-allowed'||err==='service-not-allowed'||err==='audio-capture'){
+    if(err==='not-allowed'||err==='service-not-allowed'){
       stopWake();L.toast('The wake word needs microphone access.');return;
+    }
+    if(err==='audio-capture'){                              // mic busy (another app/tab): back off and retry
+      if(++wake.fail>4){stopWake();L.toast('The microphone is busy. Close other apps using it, then turn the wake word on again.');return}
+      setTimeout(loopWake,1500*wake.fail);return;
     }
     setTimeout(loopWake,err==='network'?3000:err==='no-speech'?250:600);   // browsers end long sessions; start again
   };
-  try{r.start()}catch(e){wake.sr=null;setTimeout(loopWake,1000)}
+  srWhenFree().then(()=>{
+    if(wake.sr!==r)return;                                  // paused or replaced while waiting
+    if(!prefs.wake||wake.paused||document.hidden){wake.sr=null;return}
+    try{r.start();srOpen(r)}catch(e){wake.sr=null;setTimeout(loopWake,1000)}
+  });
 }
 function onWakeFinal(text,idx,early){
   const sum=wake.cap?wake.cap.take():null;
