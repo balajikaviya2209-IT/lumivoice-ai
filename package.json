@@ -1,0 +1,8 @@
+{
+  "name": "lumi-ai",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Lumi AI: chat, voice assistant and photo editor on Netlify, with a function that keeps your API key secret.",
+  "scripts": { "dev": "netlify dev" },
+  "engines": { "node": ">=18" }
+}
