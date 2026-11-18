@@ -1,6 +1,7 @@
 [build]
+  command = "mkdir -p Public/icons && cp -r public/icons/. Public/icons/"
   publish = "Public"
-  functions = "netlify/functions"
+  functions = "netlify/Functions"
 
 [functions]
   node_bundler = "esbuild"
